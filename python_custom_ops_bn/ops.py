@@ -29,9 +29,41 @@ def batchnorm_forward(
     return a tensor that is one of its inputs or shares memory with one.
     """
 
-    # Implement Here
+    N, C, H, W = input.shape
 
-    return output, save_mean, save_invstd
+    # Compute statistics over N, H, W for each channel
+    dims = (0, 2, 3)
+
+    if training:
+        # Batch mean and biased variance
+        batch_mean = input.mean(dim=dims)
+        batch_var = input.var(dim=dims, unbiased=False)
+
+        # Statistics used for normalization
+        save_mean = batch_mean
+        save_invstd = torch.rsqrt(batch_var + eps)
+
+        # Update running statistics in-place
+        with torch.no_grad():
+            unbiased_var = input.var(dim=dims, unbiased=True)
+
+            running_mean.mul_(1 - momentum).add_(batch_mean, alpha=momentum)
+            running_var.mul_(1 - momentum).add_(unbiased_var, alpha=momentum)
+
+    else:
+        # Use running statistics during evaluation
+        save_mean = running_mean
+        save_invstd = torch.rsqrt(running_var + eps)
+
+    # Normalize and apply affine transformation
+    mean = save_mean.view(1, C, 1, 1)
+    invstd = save_invstd.view(1, C, 1, 1)
+    gamma_view = gamma.view(1, C, 1, 1)
+    beta_view = beta.view(1, C, 1, 1)
+
+    output = (input - mean) * invstd * gamma_view + beta_view
+
+    return output, save_mean.clone(), save_invstd.clone()
 
 
 @torch.library.custom_op("my_ops::batchnorm_backward", mutates_args=())
@@ -51,7 +83,39 @@ def batchnorm_backward(
     - training=False: save_mean / save_invstd come from the running statistics (constants).
     """
 
-    # Implement Here
+    N, C, H, W = input.shape
+    dims = (0, 2, 3)
+    M = N * H * W
+
+    # Reshape channel-wise parameters for broadcasting
+    mean = save_mean.view(1, C, 1, 1)
+    invstd = save_invstd.view(1, C, 1, 1)
+    gamma_view = gamma.view(1, C, 1, 1)
+
+    # Gradient w.r.t. beta
+    grad_beta = grad_output.sum(dim=dims)
+
+    # Gradient w.r.t. gamma
+    x_hat = (input - mean) * invstd
+    grad_gamma = (grad_output * x_hat).sum(dim=dims)
+
+    # Gradient w.r.t. input
+    if training:
+        # BatchNorm training backward
+        sum_grad = grad_output.sum(dim=dims, keepdim=True)
+        sum_grad_xhat = (grad_output * x_hat).sum(dim=dims, keepdim=True)
+
+        grad_input = (
+            gamma_view * invstd / M
+            * (
+                M * grad_output
+                - sum_grad
+                - x_hat * sum_grad_xhat
+            )
+        )
+    else:
+        # Evaluation mode: running statistics are constants
+        grad_input = grad_output * gamma_view * invstd
 
     return grad_input, grad_gamma, grad_beta
 
