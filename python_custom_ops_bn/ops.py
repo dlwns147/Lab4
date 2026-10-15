@@ -83,39 +83,34 @@ def batchnorm_backward(
     - training=False: save_mean / save_invstd come from the running statistics (constants).
     """
 
-    N, C, H, W = input.shape
-    dims = (0, 2, 3)
-    M = N * H * W
+    # Reshape per-channel tensors [C] -> [1, C, 1, 1] to broadcast over [N, C, H, W]
+    mean = save_mean.view(1, -1, 1, 1)
+    invstd = save_invstd.view(1, -1, 1, 1)
+    g = gamma.view(1, -1, 1, 1)
+    reduce_dims = (0, 2, 3)
 
-    # Reshape channel-wise parameters for broadcasting
-    mean = save_mean.view(1, C, 1, 1)
-    invstd = save_invstd.view(1, C, 1, 1)
-    gamma_view = gamma.view(1, C, 1, 1)
-
-    # Gradient w.r.t. beta
-    grad_beta = grad_output.sum(dim=dims)
-
-    # Gradient w.r.t. gamma
+    # Normalized input used in the forward pass: x_hat = (x - mean) * invstd
     x_hat = (input - mean) * invstd
-    grad_gamma = (grad_output * x_hat).sum(dim=dims)
 
-    # Gradient w.r.t. input
+    # y = gamma * x_hat + beta
+    # dL/dbeta  = sum_{n,h,w} dy
+    # dL/dgamma = sum_{n,h,w} dy * x_hat
+    grad_beta = grad_output.sum(dim=reduce_dims)
+    grad_gamma = (grad_output * x_hat).sum(dim=reduce_dims)
+
     if training:
-        # BatchNorm training backward
-        sum_grad = grad_output.sum(dim=dims, keepdim=True)
-        sum_grad_xhat = (grad_output * x_hat).sum(dim=dims, keepdim=True)
-
-        grad_input = (
-            gamma_view * invstd / M
-            * (
-                M * grad_output
-                - sum_grad
-                - x_hat * sum_grad_xhat
-            )
+        # mean and invstd are functions of input. With M = N*H*W elements per channel:
+        # dL/dx = gamma * invstd / M * (M * dy - sum(dy) - x_hat * sum(dy * x_hat))
+        M = input.numel() // input.size(1)
+        grad_input = (g * invstd / M) * (
+            M * grad_output
+            - grad_beta.view(1, -1, 1, 1)
+            - x_hat * grad_gamma.view(1, -1, 1, 1)
         )
     else:
-        # Evaluation mode: running statistics are constants
-        grad_input = grad_output * gamma_view * invstd
+        # Running statistics are constants, so BN is an affine map per channel:
+        # dL/dx = dy * gamma * invstd
+        grad_input = grad_output * g * invstd
 
     return grad_input, grad_gamma, grad_beta
 
